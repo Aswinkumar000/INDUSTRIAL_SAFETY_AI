@@ -1,0 +1,396 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* ssid = "..";
+const char* password = "loveyou3000";
+
+// =====================================================
+// MQTT
+// =====================================================
+
+const char* mqtt_server = "10.18.90.4";
+const int mqtt_port = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =====================================================
+// LCD
+// =====================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =====================================================
+// DHT22
+// =====================================================
+
+#define DHTPIN          4
+#define DHTTYPE         DHT22
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// =====================================================
+// INPUTS
+// =====================================================
+
+#define MQ2_PIN         34
+
+#define DUST_PIN        35
+#define DUST_LED_PIN    32
+
+#define FLAME_LEFT_PIN  27
+
+// =====================================================
+// OUTPUTS
+// =====================================================
+
+#define ENV_GREEN       2
+#define ENV_YELLOW      12
+#define ENV_RED         13
+
+#define OVERALL_GREEN   5
+#define OVERALL_RED     18
+
+#define BUZZER_PIN      19
+#define RELAY_PIN       25      // ACTIVE HIGH
+
+// =====================================================
+
+unsigned long lastPublish = 0;
+
+String envStatus = "NORMAL";
+String factoryStatus = "NORMAL";
+String reasonText = "SAFE";
+float confidenceValue = 0;
+
+// =====================================================
+// WIFI
+// =====================================================
+
+void connectWiFi()
+{
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting WiFi");
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("WiFi Connected");
+    Serial.println(WiFi.localIP());
+}
+
+// =====================================================
+// APPLY STATUS
+// =====================================================
+
+void applyStatus()
+{
+    if (envStatus == "NORMAL")
+    {
+        digitalWrite(ENV_GREEN, HIGH);
+        digitalWrite(ENV_YELLOW, LOW);
+        digitalWrite(ENV_RED, LOW);
+
+        digitalWrite(RELAY_PIN, LOW);
+        noTone(BUZZER_PIN);
+    }
+
+    else if (envStatus == "CAUTION")
+    {
+        digitalWrite(ENV_GREEN, LOW);
+        digitalWrite(ENV_YELLOW, HIGH);
+        digitalWrite(ENV_RED, LOW);
+
+        digitalWrite(RELAY_PIN, HIGH);
+        noTone(BUZZER_PIN);
+    }
+
+    else if (envStatus == "DANGER")
+    {
+        digitalWrite(ENV_GREEN, LOW);
+        digitalWrite(ENV_YELLOW, LOW);
+        digitalWrite(ENV_RED, HIGH);
+
+        digitalWrite(RELAY_PIN, HIGH);
+        tone(BUZZER_PIN, 2000);
+    }
+
+    // Factory LEDs
+
+    if (factoryStatus == "DANGER")
+    {
+        digitalWrite(OVERALL_GREEN, LOW);
+        digitalWrite(OVERALL_RED, HIGH);
+    }
+    else
+    {
+        digitalWrite(OVERALL_GREEN, HIGH);
+        digitalWrite(OVERALL_RED, LOW);
+    }
+
+    // LCD
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print(envStatus);
+
+    lcd.setCursor(0, 1);
+    lcd.print(reasonText);
+}
+
+// =====================================================
+// MQTT CALLBACK
+// =====================================================
+
+void callback(char* topic, byte* payload, unsigned int length)
+{
+    String message = "";
+
+    for (unsigned int i = 0; i < length; i++)
+    {
+        message += (char)payload[i];
+    }
+
+    Serial.println();
+    Serial.println("===== AI RESPONSE =====");
+    Serial.println(message);
+
+    StaticJsonDocument<512> doc;
+
+    DeserializationError error =
+        deserializeJson(doc, message);
+
+    if (error)
+    {
+        Serial.println("JSON Parse Failed");
+        return;
+    }
+
+    envStatus =
+        doc["env_status"] | "NORMAL";
+
+    factoryStatus =
+        doc["factory_status"] | "NORMAL";
+
+    reasonText =
+        doc["reason"] | "SAFE";
+
+    confidenceValue =
+        doc["confidence"] | 0;
+
+    applyStatus();
+}
+
+// =====================================================
+// MQTT RECONNECT
+// =====================================================
+
+void reconnectMQTT()
+{
+    while (!client.connected())
+    {
+        Serial.print("MQTT Connecting...");
+
+        if (client.connect("EnvironmentESP32"))
+        {
+            Serial.println("Connected");
+
+            client.subscribe(
+                "factory/prediction"
+            );
+
+            Serial.println(
+                "Subscribed: factory/prediction"
+            );
+        }
+        else
+        {
+            Serial.print("Failed rc=");
+            Serial.println(client.state());
+
+            delay(2000);
+        }
+    }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    dht.begin();
+
+    pinMode(DUST_LED_PIN, OUTPUT);
+    pinMode(FLAME_LEFT_PIN, INPUT);
+
+    pinMode(ENV_GREEN, OUTPUT);
+    pinMode(ENV_YELLOW, OUTPUT);
+    pinMode(ENV_RED, OUTPUT);
+
+    pinMode(OVERALL_GREEN, OUTPUT);
+    pinMode(OVERALL_RED, OUTPUT);
+
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(RELAY_PIN, OUTPUT);
+
+    digitalWrite(RELAY_PIN, LOW);
+
+    Wire.begin(21, 22);
+
+    lcd.init();
+    lcd.backlight();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Factory AI");
+    lcd.setCursor(0, 1);
+    lcd.print("Starting...");
+
+    connectWiFi();
+
+    client.setServer(
+        mqtt_server,
+        mqtt_port
+    );
+
+    client.setCallback(callback);
+
+    delay(2000);
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+    if (!client.connected())
+    {
+        reconnectMQTT();
+    }
+
+    client.loop();
+
+    if (millis() - lastPublish > 3000)
+    {
+        lastPublish = millis();
+
+        float temp =
+            dht.readTemperature();
+
+        float humidity =
+            dht.readHumidity();
+
+        if (isnan(temp))
+            temp = 0;
+
+        if (isnan(humidity))
+            humidity = 0;
+
+        int gas =
+            analogRead(MQ2_PIN);
+
+        // Dust Sensor
+
+        digitalWrite(
+            DUST_LED_PIN,
+            LOW
+        );
+
+        delayMicroseconds(280);
+
+        int dust =
+            analogRead(DUST_PIN);
+
+        delayMicroseconds(40);
+
+        digitalWrite(
+            DUST_LED_PIN,
+            HIGH
+        );
+
+        delayMicroseconds(9680);
+
+        int flame =
+            digitalRead(
+                FLAME_LEFT_PIN
+            );
+
+        // JSON Publish
+
+        StaticJsonDocument<256> doc;
+
+        doc["temp"] = temp;
+        doc["humidity"] = humidity;
+        doc["gas_ppm"] = gas;
+        doc["dust"] = dust;
+        doc["flame"] = flame;
+
+        char payload[256];
+
+        serializeJson(
+            doc,
+            payload
+        );
+
+        client.publish(
+            "environment/env_sensors",
+            payload
+        );
+
+        Serial.println();
+        Serial.println("===== SENSOR DATA =====");
+
+        Serial.print("Temp      : ");
+        Serial.println(temp);
+
+        Serial.print("Humidity  : ");
+        Serial.println(humidity);
+
+        Serial.print("Gas       : ");
+        Serial.println(gas);
+
+        Serial.print("Dust      : ");
+        Serial.println(dust);
+
+        Serial.print("Flame     : ");
+        Serial.println(flame);
+
+        Serial.println();
+        Serial.print("Published: ");
+        Serial.println(payload);
+
+        Serial.println();
+        Serial.println("===== LAST AI STATUS =====");
+
+        Serial.print("Environment : ");
+        Serial.println(envStatus);
+
+        Serial.print("Factory     : ");
+        Serial.println(factoryStatus);
+
+        Serial.print("Reason      : ");
+        Serial.println(reasonText);
+
+        Serial.print("Confidence  : ");
+        Serial.print(confidenceValue);
+        Serial.println("%");
+    }
+}
