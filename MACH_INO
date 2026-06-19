@@ -1,0 +1,325 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+
+// ----------------------
+// Ultrasonic
+// ----------------------
+#define TRIG 26
+#define ECHO 25
+
+// ----------------------
+// Sensors
+// ----------------------
+#define IR_PIN 14
+#define SW420 27
+#define LIMIT 13
+#define HALL 34
+
+// ----------------------
+// DHT11
+// ----------------------
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+// ----------------------
+// LM35
+// ----------------------
+#define LM35 32
+
+// ----------------------
+// ACS712
+// ----------------------
+#define ACS_CONVEYOR 35
+#define ACS_DUMMY 33
+
+// ----------------------
+// L298N
+// ----------------------
+#define ENA 23
+#define IN1 5
+#define IN2 15
+
+// ----------------------
+// Servos
+// ----------------------
+#define BASE_PIN 16
+#define SHOULDER_PIN 17
+#define ELBOW_PIN 18
+#define GRIPPER_PIN 19
+
+Servo baseServo;
+Servo shoulderServo;
+Servo elbowServo;
+Servo gripperServo;
+
+DHT dht(DHTPIN, DHTTYPE);
+MPU6050 mpu;
+
+const float VREF = 3.3;
+const float SENSITIVITY = 0.185;
+
+float conveyorZero = 0;
+float dummyZero = 0;
+
+unsigned long lastPrint = 0;
+
+// ----------------------
+// ACS Calibration
+// ----------------------
+float calibrateACS(int pin)
+{
+  long sum = 0;
+
+  for(int i=0;i<2000;i++)
+  {
+    sum += analogRead(pin);
+    delay(1);
+  }
+
+  float adc = sum / 2000.0;
+
+  return adc * VREF / 4095.0;
+}
+
+// ----------------------
+// Current Reading
+// ----------------------
+float getCurrent(int pin, float zero)
+{
+  long sum = 0;
+
+  for(int i=0;i<300;i++)
+  {
+    sum += analogRead(pin);
+  }
+
+  float adc = sum / 300.0;
+
+  float voltage = adc * VREF / 4095.0;
+
+  return abs((voltage - zero) / SENSITIVITY);
+}
+
+// ----------------------
+// Conveyor
+// ----------------------
+void startConveyor()
+{
+  digitalWrite(ENA, HIGH);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  Serial.println("Conveyor Started");
+}
+
+void stopConveyor()
+{
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  Serial.println("Conveyor Stopped");
+}
+
+// ----------------------
+// Setup
+// ----------------------
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  pinMode(IR_PIN, INPUT);
+  pinMode(SW420, INPUT);
+
+  pinMode(LIMIT, INPUT_PULLUP);
+  pinMode(HALL, INPUT);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  dht.begin();
+
+  Wire.begin();
+  mpu.initialize();
+
+  baseServo.attach(BASE_PIN);
+  shoulderServo.attach(SHOULDER_PIN);
+  elbowServo.attach(ELBOW_PIN);
+  gripperServo.attach(GRIPPER_PIN);
+
+  Serial.println("Calibrating ACS712...");
+
+  conveyorZero = calibrateACS(ACS_CONVEYOR);
+  dummyZero = calibrateACS(ACS_DUMMY);
+
+  Serial.println("Calibration Complete");
+
+  Serial.println("Commands:");
+  Serial.println("start");
+  Serial.println("stop");
+  Serial.println("b90");
+  Serial.println("s120");
+  Serial.println("e45");
+  Serial.println("g30");
+}
+
+// ----------------------
+// Loop
+// ----------------------
+void loop()
+{
+  // ----------------------
+  // Commands
+  // ----------------------
+
+  if(Serial.available())
+  {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if(cmd == "start")
+    {
+      startConveyor();
+    }
+    else if(cmd == "stop")
+    {
+      stopConveyor();
+    }
+    else
+    {
+      char servoType = cmd.charAt(0);
+      int angle = cmd.substring(1).toInt();
+
+      angle = constrain(angle, 0, 180);
+
+      switch(servoType)
+      {
+        case 'b':
+          baseServo.write(angle);
+          Serial.print("Base -> ");
+          Serial.println(angle);
+          break;
+
+        case 's':
+          shoulderServo.write(angle);
+          Serial.print("Shoulder -> ");
+          Serial.println(angle);
+          break;
+
+        case 'e':
+          elbowServo.write(angle);
+          Serial.print("Elbow -> ");
+          Serial.println(angle);
+          break;
+
+        case 'g':
+          gripperServo.write(angle);
+          Serial.print("Gripper -> ");
+          Serial.println(angle);
+          break;
+      }
+    }
+  }
+
+  // ----------------------
+  // Print Sensors Every 1s
+  // ----------------------
+
+  if(millis() - lastPrint >= 1000)
+  {
+    lastPrint = millis();
+
+    // Ultrasonic
+    digitalWrite(TRIG, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(TRIG, LOW);
+
+    long duration = pulseIn(ECHO, HIGH);
+
+    float distance = duration * 0.034 / 2;
+
+    // DHT
+    float dhtTemp = dht.readTemperature();
+    float humidity = dht.readHumidity();
+
+    // LM35
+    int lmRaw = analogRead(LM35);
+
+    float lmVoltage =
+      lmRaw * (3.3 / 4095.0);
+
+    float lm35Temp =
+      lmVoltage * 100.0;
+
+    // Current
+    float conveyorCurrent =
+      getCurrent(ACS_CONVEYOR, conveyorZero);
+
+    float dummyCurrent =
+      getCurrent(ACS_DUMMY, dummyZero);
+
+    // MPU6050
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+
+    mpu.getMotion6(
+      &ax,&ay,&az,
+      &gx,&gy,&gz
+    );
+
+    Serial.println("\n======================");
+
+    Serial.print("Distance: ");
+    Serial.println(distance);
+
+    Serial.print("IR: ");
+    Serial.println(digitalRead(IR_PIN));
+
+    Serial.print("SW420: ");
+    Serial.println(digitalRead(SW420));
+
+    Serial.print("Limit: ");
+    Serial.println(digitalRead(LIMIT));
+
+    Serial.print("Hall: ");
+    Serial.println(digitalRead(HALL));
+
+    Serial.print("DHT Temp: ");
+    Serial.println(dhtTemp);
+
+    Serial.print("Humidity: ");
+    Serial.println(humidity);
+
+    Serial.print("LM35 Temp: ");
+    Serial.println(lm35Temp);
+
+    Serial.print("Conveyor Current: ");
+    Serial.println(conveyorCurrent);
+
+    Serial.print("Dummy Current: ");
+    Serial.println(dummyCurrent);
+
+    Serial.print("AX=");
+    Serial.print(ax);
+    Serial.print(" AY=");
+    Serial.print(ay);
+    Serial.print(" AZ=");
+    Serial.println(az);
+
+    Serial.print("GX=");
+    Serial.print(gx);
+    Serial.print(" GY=");
+    Serial.print(gy);
+    Serial.print(" GZ=");
+    Serial.println(gz);
+  }
+}
